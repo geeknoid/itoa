@@ -47,6 +47,28 @@ library.
 
 ![performance](https://raw.githubusercontent.com/dtolnay/itoa/master/itoa-benchmark.png)
 
+This repository also contains Criterion and Gungraun microbenchmarks. Run the
+Gungraun benchmarks with:
+
+```console
+cargo install --version 0.18.2 gungraun-runner
+cargo bench --bench gungraun
+```
+
+Gungraun requires Valgrind to be installed.
+On x86-64, the SIMD-optimized path is gated on the `sse4.1` and `lzcnt`
+target features. Enable exactly those to benchmark it:
+
+```console
+RUSTFLAGS="-C target-feature=+sse4.1,+lzcnt" cargo bench --bench gungraun
+```
+
+Do not use `-C target-cpu=native` here. On AVX-512-capable CPUs (for example
+AMD Zen 4/5) it lets the compiler autovectorize the digit conversion into
+EVEX-encoded AVX-512 instructions, which Valgrind cannot decode and which make
+Gungraun abort with `SIGILL`. The `+sse4.1,+lzcnt` feature set exercises the
+same optimized code without emitting instructions Valgrind rejects.
+
 <br>
 
 #### License

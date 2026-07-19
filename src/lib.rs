@@ -167,12 +167,21 @@ macro_rules! impl_Integer {
             #[cfg_attr(feature = "no-panic", no_panic)]
             fn write(self, buf: &mut Self::Buffer) -> &str {
                 let mut offset = Self::MAX_STR_LEN - $Unsigned::MAX_STR_LEN;
-                offset += Unsigned::fmt(
-                    self.unsigned_abs(),
-                    (&mut buf[offset..]).try_into().unwrap(),
-                );
+                // SAFETY: `offset == Self::MAX_STR_LEN - $Unsigned::MAX_STR_LEN`,
+                // so the `$Unsigned::MAX_STR_LEN` bytes starting at `offset` are
+                // exactly the tail of `buf` and form a valid unsigned buffer.
+                let unsigned_buf = unsafe {
+                    &mut *buf
+                        .as_mut_ptr()
+                        .add(offset)
+                        .cast::<<$Unsigned as private::Sealed>::Buffer>()
+                };
+                offset += Unsigned::fmt(self.unsigned_abs(), unsigned_buf);
                 if self < 0 {
                     offset -= 1;
+                    // SAFETY: `offset` indexes the byte immediately before the
+                    // digits, which is within `buf`.
+                    unsafe { assert_unchecked(offset < buf.len()) };
                     buf[offset].write(b'-');
                 }
                 // SAFETY: Starting from `offset`, all elements of the slice have been set.
@@ -236,6 +245,77 @@ fn divmod100(value: u32) -> (u32, u32) {
     (div, value - div * 100)
 }
 
+/// Informs the optimizer that `cond` always holds, so that it can discard the
+/// bounds checks and panic paths that depend on it.
+///
+/// This is [`core::hint::assert_unchecked`], which is newer than this crate's
+/// minimum supported Rust version.
+///
+/// # Safety
+///
+/// `cond` must be true.
+#[inline(always)]
+unsafe fn assert_unchecked(cond: bool) {
+    debug_assert!(cond);
+    if !cond {
+        // SAFETY: The caller guarantees that `cond` holds.
+        unsafe { hint::unreachable_unchecked() };
+    }
+}
+
+/// Writes `pair` as exactly two decimal digits into `buf[offset..offset + 2]`,
+/// zero padded (for example 7 becomes `"07"`).
+///
+/// # Safety
+///
+/// `pair` must be below 100, and both `offset` and `offset + 1` must be valid
+/// indices into `buf`.
+#[inline(always)]
+unsafe fn write_pair(buf: &mut [MaybeUninit<u8>], offset: usize, pair: u32) {
+    // SAFETY: These are this function's caller-provided invariants. They let
+    // the indexing below compile without bounds checks. Each index is asserted
+    // individually because `offset + n < buf.len()` alone would also hold for
+    // an `offset` whose addition wraps around.
+    unsafe {
+        assert_unchecked(pair < 100);
+        assert_unchecked(offset + 0 < buf.len());
+        assert_unchecked(offset + 1 < buf.len());
+    }
+
+    let pair = pair as usize;
+    buf[offset + 0].write(DECIMAL_PAIRS.0[pair * 2 + 0]);
+    buf[offset + 1].write(DECIMAL_PAIRS.0[pair * 2 + 1]);
+}
+
+/// Writes `quad` as exactly four decimal digits into `buf[offset..offset + 4]`,
+/// zero padded (for example 42 becomes `"0042"`).
+///
+/// # Safety
+///
+/// `quad` must be below 10_000, and `offset..offset + 4` must all be valid
+/// indices into `buf`.
+#[inline(always)]
+unsafe fn write_quad(buf: &mut [MaybeUninit<u8>], offset: usize, quad: u32) {
+    // SAFETY: These are this function's caller-provided invariants.
+    unsafe {
+        assert_unchecked(quad < 10_000);
+        assert_unchecked(offset + 0 < buf.len());
+        assert_unchecked(offset + 1 < buf.len());
+        assert_unchecked(offset + 2 < buf.len());
+        assert_unchecked(offset + 3 < buf.len());
+    }
+
+    let (pair1, pair2) = divmod100(quad);
+    // SAFETY: `quad` is below 10_000, so both halves are below 100.
+    unsafe { assert_unchecked(pair1 < 100 && pair2 < 100) };
+
+    // SAFETY: Both pairs are below 100 and all four indices are in bounds.
+    unsafe {
+        write_pair(buf, offset + 0, pair1);
+        write_pair(buf, offset + 2, pair2);
+    }
+}
+
 /// This function converts a slice of ascii characters into a `&str` starting
 /// from `offset`.
 ///
@@ -263,36 +343,35 @@ macro_rules! impl_Unsigned {
             fn fmt(self, buf: &mut Self::Buffer) -> usize {
                 // Count the number of bytes in buf that are not initialized.
                 let mut offset = buf.len();
+                if self == 0 {
+                    offset -= 1;
+                    // SAFETY: Every integer buffer has room for at least one digit.
+                    unsafe { assert_unchecked(offset < buf.len()) };
+                    buf[offset].write(b'0');
+                    return offset;
+                }
                 // Consume the least-significant decimals from a working copy.
                 let mut remain = self;
 
                 // Format per four digits from the lookup table.
-                // Four digits need a 16-bit $Unsigned or wider.
+                // Four digits need a 16-bit $Unsigned or wider. The fallible
+                // conversions cannot panic: for `u8` the `size_of` guard makes
+                // the loop dead, and `unwrap_or` avoids a panic path there; for
+                // wider types the constants convert successfully.
                 while mem::size_of::<Self>() > 1
-                    && remain
-                        > 999
-                            .try_into()
-                            .expect("branch is not hit for types that cannot fit 999 (u8)")
+                    && remain > 999.try_into().unwrap_or(Self::MAX)
                 {
                     offset -= 4;
 
                     // pull two pairs
-                    let scale: Self = 1_00_00
-                        .try_into()
-                        .expect("branch is not hit for types that cannot fit 1E4 (u8)");
+                    let scale: Self = 1_00_00.try_into().unwrap_or(1);
                     let quad = remain % scale;
                     remain /= scale;
-                    let (pair1, pair2) = divmod100(quad as u32);
-                    unsafe {
-                        buf[offset + 0]
-                            .write(*DECIMAL_PAIRS.0.get_unchecked(pair1 as usize * 2 + 0));
-                        buf[offset + 1]
-                            .write(*DECIMAL_PAIRS.0.get_unchecked(pair1 as usize * 2 + 1));
-                        buf[offset + 2]
-                            .write(*DECIMAL_PAIRS.0.get_unchecked(pair2 as usize * 2 + 0));
-                        buf[offset + 3]
-                            .write(*DECIMAL_PAIRS.0.get_unchecked(pair2 as usize * 2 + 1));
-                    }
+                    // SAFETY: `quad` is a remainder modulo 10_000. Every four
+                    // digits written consume four of the `MAX_STR_LEN` bytes
+                    // this type's buffer is sized for, so `offset` was just
+                    // decremented into bounds and never drops below zero.
+                    unsafe { write_quad(buf.as_mut_slice(), offset, quad as u32) };
                 }
 
                 // Format per two digits from the lookup table.
@@ -301,21 +380,19 @@ macro_rules! impl_Unsigned {
 
                     let (last, pair) = divmod100(remain as u32);
                     remain = last as Self;
-                    unsafe {
-                        buf[offset + 0]
-                            .write(*DECIMAL_PAIRS.0.get_unchecked(pair as usize * 2 + 0));
-                        buf[offset + 1]
-                            .write(*DECIMAL_PAIRS.0.get_unchecked(pair as usize * 2 + 1));
-                    }
+                    // SAFETY: `pair` is a remainder modulo 100, and `offset` was
+                    // just decremented by 2 without dropping below zero.
+                    unsafe { write_pair(buf.as_mut_slice(), offset, pair) };
                 }
 
                 // Format the last remaining digit, if any.
                 if remain != 0 || self == 0 {
                     offset -= 1;
 
-                    // Either the compiler sees that remain < 10, or it prevents
-                    // a boundary check up next.
                     let last = remain as u8 & 15;
+                    // SAFETY: `offset` was just decremented by 1 and never drops
+                    // below zero, so it is a valid index into `buf`.
+                    unsafe { assert_unchecked(offset < buf.len()) };
                     buf[offset].write(b'0' + last);
                     // not used: remain = 0;
                 }
@@ -327,9 +404,135 @@ macro_rules! impl_Unsigned {
 }
 
 impl_Unsigned!(u8);
+#[cfg(not(all(target_feature = "sse4.1", target_feature = "lzcnt")))]
 impl_Unsigned!(u16);
 impl_Unsigned!(u32);
+#[cfg(not(all(target_feature = "sse4.1", target_feature = "lzcnt")))]
 impl_Unsigned!(u64);
+
+#[cfg(all(
+    target_feature = "sse4.1",
+    target_feature = "lzcnt"
+))]
+#[inline]
+#[cfg_attr(feature = "no-panic", no_panic)]
+fn to_bcd4(abcd: u16) -> u32 {
+    let abcd = u32::from(abcd);
+    let ab_cd = abcd + (0x10000 - 100) * ((abcd * 0x147b) >> 19);
+    ab_cd + (0x100 - 10) * (((ab_cd * 0x67) >> 10) & 0xf000f)
+}
+
+#[cfg(all(
+    target_feature = "sse4.1",
+    target_feature = "lzcnt"
+))]
+impl Unsigned for u16 {
+    #[cfg_attr(feature = "no-panic", no_panic)]
+    fn fmt(self, buf: &mut Self::Buffer) -> usize {
+        if self == 0 {
+            buf[4].write(b'0');
+            return 4;
+        }
+        if self >= 10_000 {
+            let high = self / 10_000;
+            let bcd = to_bcd4(self % 10_000);
+            buf[0].write(b'0' + high as u8);
+            // SAFETY: Bytes 1..5 are within the five-byte output buffer.
+            unsafe {
+                buf.as_mut_ptr()
+                    .add(1)
+                    .cast::<u32>()
+                    .write_unaligned((bcd | 0x30303030).to_be());
+            }
+            return 0;
+        }
+        let bcd = to_bcd4(self);
+        let leading_zeros = bcd.leading_zeros() as usize / 8;
+        // SAFETY: Bytes 1..5 are within the five-byte output buffer.
+        unsafe {
+            buf.as_mut_ptr()
+                .add(1)
+                .cast::<u32>()
+                .write_unaligned((bcd | 0x30303030).to_be());
+        }
+        1 + leading_zeros
+    }
+}
+
+#[cfg(all(
+    target_feature = "sse4.1",
+    target_feature = "lzcnt"
+))]
+impl Unsigned for u64 {
+    #[cfg_attr(feature = "no-panic", no_panic)]
+    fn fmt(self, buf: &mut Self::Buffer) -> usize {
+        if self == 0 {
+            buf[19].write(b'0');
+            return 19;
+        }
+        let out = buf.as_mut_ptr().cast::<u32>();
+
+        if self >= 10_000_000_000_000_000 {
+            let top = self / 10_000_000_000_000_000;
+            let hi = (self % 10_000_000_000_000_000 / 100_000_000) as u32;
+            let lo = (self % 100_000_000) as u32;
+            let bcd_top = to_bcd4(top as u16);
+            let bcd_hi_hi = to_bcd4((hi / 10_000) as u16);
+            let bcd_hi_lo = to_bcd4((hi % 10_000) as u16);
+            let bcd_lo_hi = to_bcd4((lo / 10_000) as u16);
+            let bcd_lo_lo = to_bcd4((lo % 10_000) as u16);
+            let leading_zeros = bcd_top.leading_zeros() as usize / 8;
+            // SAFETY: The five writes cover exactly the 20-byte output buffer.
+            unsafe {
+                out.write_unaligned((bcd_top | 0x30303030).to_be());
+                out.add(1).write_unaligned((bcd_hi_hi | 0x30303030).to_be());
+                out.add(2).write_unaligned((bcd_hi_lo | 0x30303030).to_be());
+                out.add(3).write_unaligned((bcd_lo_hi | 0x30303030).to_be());
+                out.add(4).write_unaligned((bcd_lo_lo | 0x30303030).to_be());
+            }
+            return leading_zeros;
+        }
+
+        if self >= 100_000_000 {
+            let hi = (self / 100_000_000) as u32;
+            let lo = (self % 100_000_000) as u32;
+            let bcd_hi_hi = to_bcd4((hi / 10_000) as u16);
+            let bcd_hi_lo = to_bcd4((hi % 10_000) as u16);
+            let bcd_lo_hi = to_bcd4((lo / 10_000) as u16);
+            let bcd_lo_lo = to_bcd4((lo % 10_000) as u16);
+            let leading_zeros =
+                ((u64::from(bcd_hi_hi) << 32) | u64::from(bcd_hi_lo)).leading_zeros() as usize / 8;
+            // SAFETY: The four writes cover bytes 4..20 of the output buffer.
+            unsafe {
+                out.add(1).write_unaligned((bcd_hi_hi | 0x30303030).to_be());
+                out.add(2).write_unaligned((bcd_hi_lo | 0x30303030).to_be());
+                out.add(3).write_unaligned((bcd_lo_hi | 0x30303030).to_be());
+                out.add(4).write_unaligned((bcd_lo_lo | 0x30303030).to_be());
+            }
+            return 4 + leading_zeros;
+        }
+
+        if self >= 10_000 {
+            let bcd_hi = to_bcd4((self / 10_000) as u16);
+            let bcd_lo = to_bcd4((self % 10_000) as u16);
+            let leading_zeros = bcd_hi.leading_zeros() as usize / 8;
+            // SAFETY: The two writes cover bytes 12..20 of the output buffer.
+            unsafe {
+                out.add(3).write_unaligned((bcd_hi | 0x30303030).to_be());
+                out.add(4).write_unaligned((bcd_lo | 0x30303030).to_be());
+            }
+            return 12 + leading_zeros;
+        }
+
+        let bcd = to_bcd4(self as u16);
+        let leading_zeros = bcd.leading_zeros() as usize / 8;
+        // SAFETY: The write covers bytes 16..20 of the output buffer.
+        unsafe {
+            out.add(4).write_unaligned((bcd | 0x30303030).to_be());
+        }
+        16 + leading_zeros
+    }
+}
 
 impl Unsigned for u128 {
     #[cfg_attr(feature = "no-panic", no_panic)]
@@ -347,7 +550,9 @@ impl Unsigned for u128 {
             (mod_1e16, u128::MAX_STR_LEN)
         } else {
             // Write digits at buf[23..39].
-            enc_16lsd::<{ u128::MAX_STR_LEN - 16 }>(buf, mod_1e16);
+            // SAFETY: `mod_1e16` is a remainder modulo 1e16, and
+            // `u128::MAX_STR_LEN - 16 + 16 == buf.len()`.
+            unsafe { enc_16lsd::<{ u128::MAX_STR_LEN - 16 }>(buf, mod_1e16) };
 
             // Take another 16 decimals.
             let (quot2, mod2) = div_rem_1e16(quot_1e16);
@@ -355,8 +560,16 @@ impl Unsigned for u128 {
                 (mod2, u128::MAX_STR_LEN - 16)
             } else {
                 // Write digits at buf[7..23].
-                enc_16lsd::<{ u128::MAX_STR_LEN - 32 }>(buf, mod2);
+                // SAFETY: `mod2` is a remainder modulo 1e16, and
+                // `u128::MAX_STR_LEN - 32 + 16 <= buf.len()`.
+                unsafe { enc_16lsd::<{ u128::MAX_STR_LEN - 32 }>(buf, mod2) };
+                #[cfg(all(
+                    target_feature = "sse4.1",
+                    target_feature = "lzcnt"
+                ))]
+                return enc_7msd(buf, quot2 as u32);
                 // Quot2 has at most 7 decimals remaining after two 1e16 divisions.
+                #[cfg(not(all(target_feature = "sse4.1", target_feature = "lzcnt")))]
                 (quot2 as u64, u128::MAX_STR_LEN - 32)
             }
         };
@@ -368,13 +581,9 @@ impl Unsigned for u128 {
             // pull two pairs
             let quad = remain % 1_00_00;
             remain /= 1_00_00;
-            let (pair1, pair2) = divmod100(quad as u32);
-            unsafe {
-                buf[offset + 0].write(*DECIMAL_PAIRS.0.get_unchecked(pair1 as usize * 2 + 0));
-                buf[offset + 1].write(*DECIMAL_PAIRS.0.get_unchecked(pair1 as usize * 2 + 1));
-                buf[offset + 2].write(*DECIMAL_PAIRS.0.get_unchecked(pair2 as usize * 2 + 0));
-                buf[offset + 3].write(*DECIMAL_PAIRS.0.get_unchecked(pair2 as usize * 2 + 1));
-            }
+            // SAFETY: `quad` is a remainder modulo 10_000, and the loop above
+            // reserves four bytes per iteration within `buf`.
+            unsafe { write_quad(buf.as_mut_slice(), offset, quad as u32) };
         }
 
         // Format per two digits from the lookup table.
@@ -383,19 +592,19 @@ impl Unsigned for u128 {
 
             let (last, pair) = divmod100(remain as u32);
             remain = last as u64;
-            unsafe {
-                buf[offset + 0].write(*DECIMAL_PAIRS.0.get_unchecked(pair as usize * 2 + 0));
-                buf[offset + 1].write(*DECIMAL_PAIRS.0.get_unchecked(pair as usize * 2 + 1));
-            }
+            // SAFETY: `pair` is a remainder modulo 100, and `offset` was just
+            // decremented by 2 without dropping below zero.
+            unsafe { write_pair(buf.as_mut_slice(), offset, pair) };
         }
 
         // Format the last remaining digit, if any.
         if remain != 0 {
             offset -= 1;
 
-            // Either the compiler sees that remain < 10, or it prevents
-            // a boundary check up next.
             let last = remain as u8 & 15;
+            // SAFETY: `offset` was just decremented by 1 and never drops below
+            // zero, so it is a valid index into `buf`.
+            unsafe { assert_unchecked(offset < buf.len()) };
             buf[offset].write(b'0' + last);
             // not used: remain = 0;
         }
@@ -404,8 +613,19 @@ impl Unsigned for u128 {
 }
 
 // Encodes the 16 least-significant decimals of n into `buf[OFFSET..OFFSET + 16]`.
+//
+// # Safety
+//
+// `n` must be below 1e16, and `OFFSET + 16` must not exceed `buf.len()`.
+#[cfg(not(all(target_feature = "sse4.1", target_feature = "lzcnt")))]
 #[cfg_attr(feature = "no-panic", no_panic)]
-fn enc_16lsd<const OFFSET: usize>(buf: &mut [MaybeUninit<u8>], n: u64) {
+unsafe fn enc_16lsd<const OFFSET: usize>(buf: &mut [MaybeUninit<u8>], n: u64) {
+    // SAFETY: These are this function's caller-provided invariants.
+    unsafe {
+        assert_unchecked(n < 10_000_000_000_000_000);
+        assert_unchecked(OFFSET + 16 <= buf.len());
+    }
+
     // Consume the least-significant decimals from a working copy.
     let mut remain = n;
 
@@ -414,26 +634,80 @@ fn enc_16lsd<const OFFSET: usize>(buf: &mut [MaybeUninit<u8>], n: u64) {
         // pull two pairs
         let quad = remain % 1_00_00;
         remain /= 1_00_00;
-        let (pair1, pair2) = divmod100(quad as u32);
-        unsafe {
-            buf[quad_index * 4 + OFFSET + 0]
-                .write(*DECIMAL_PAIRS.0.get_unchecked(pair1 as usize * 2 + 0));
-            buf[quad_index * 4 + OFFSET + 1]
-                .write(*DECIMAL_PAIRS.0.get_unchecked(pair1 as usize * 2 + 1));
-            buf[quad_index * 4 + OFFSET + 2]
-                .write(*DECIMAL_PAIRS.0.get_unchecked(pair2 as usize * 2 + 0));
-            buf[quad_index * 4 + OFFSET + 3]
-                .write(*DECIMAL_PAIRS.0.get_unchecked(pair2 as usize * 2 + 1));
-        }
+        // SAFETY: `quad` is a remainder modulo 10_000, and `quad_index` ranges
+        // over 1..4 so the write stays within `OFFSET..OFFSET + 16`.
+        unsafe { write_quad(buf, OFFSET + quad_index * 4, quad as u32) };
     }
 
     // final two pairs
-    let (pair1, pair2) = divmod100(remain as u32);
+    // SAFETY: `n` is below 1e16, so the remaining decimals are below 10_000,
+    // and `OFFSET..OFFSET + 4` are in bounds.
+    unsafe { write_quad(buf, OFFSET, remain as u32) };
+}
+
+#[cfg(all(
+    target_feature = "sse4.1",
+    target_feature = "lzcnt"
+))]
+// # Safety
+//
+// `n` must be below 1e16, and `OFFSET + 16` must not exceed `buf.len()`.
+#[cfg_attr(feature = "no-panic", no_panic)]
+unsafe fn enc_16lsd<const OFFSET: usize>(buf: &mut [MaybeUninit<u8>], n: u64) {
+    let hi = (n / 100_000_000) as u32;
+    let lo = (n % 100_000_000) as u32;
+    // SAFETY: Callers provide an offset with at least 16 remaining bytes.
+    let out = unsafe { buf.as_mut_ptr().add(OFFSET).cast::<u32>() };
+    let bcd_hi_hi = to_bcd4((hi / 10_000) as u16);
+    let bcd_hi_lo = to_bcd4((hi % 10_000) as u16);
+    let bcd_lo_hi = to_bcd4((lo / 10_000) as u16);
+    let bcd_lo_lo = to_bcd4((lo % 10_000) as u16);
+    // SAFETY: The four writes cover the 16 bytes starting at OFFSET.
     unsafe {
-        buf[OFFSET + 0].write(*DECIMAL_PAIRS.0.get_unchecked(pair1 as usize * 2 + 0));
-        buf[OFFSET + 1].write(*DECIMAL_PAIRS.0.get_unchecked(pair1 as usize * 2 + 1));
-        buf[OFFSET + 2].write(*DECIMAL_PAIRS.0.get_unchecked(pair2 as usize * 2 + 0));
-        buf[OFFSET + 3].write(*DECIMAL_PAIRS.0.get_unchecked(pair2 as usize * 2 + 1));
+        out.write_unaligned((bcd_hi_hi | 0x30303030).to_be());
+        out.add(1).write_unaligned((bcd_hi_lo | 0x30303030).to_be());
+        out.add(2).write_unaligned((bcd_lo_hi | 0x30303030).to_be());
+        out.add(3).write_unaligned((bcd_lo_lo | 0x30303030).to_be());
+    }
+}
+
+#[cfg(all(
+    target_feature = "sse4.1",
+    target_feature = "lzcnt"
+))]
+#[cfg_attr(feature = "no-panic", no_panic)]
+fn enc_7msd(buf: &mut [MaybeUninit<u8>], n: u32) -> usize {
+    debug_assert!(n < 10_000_000);
+    if n < 10_000 {
+        let bcd = to_bcd4(n as u16);
+        let leading_zeros = bcd.leading_zeros() as usize / 8;
+        // SAFETY: The write covers bytes 3..7 of the output buffer.
+        unsafe {
+            buf.as_mut_ptr()
+                .add(3)
+                .cast::<u32>()
+                .write_unaligned((bcd | 0x30303030).to_be());
+        }
+        3 + leading_zeros
+    } else {
+        let bcd_hi = to_bcd4((n / 10_000) as u16);
+        let bcd_lo = to_bcd4((n % 10_000) as u16);
+        let leading_zeros = bcd_hi.leading_zeros() as usize / 8;
+        let hi = (bcd_hi | 0x30303030).to_be_bytes();
+        // SAFETY: `enc_7msd` writes into `buf[0..7]`; bytes 0..3 are in bounds.
+        unsafe {
+            buf.get_unchecked_mut(0).write(hi[1]);
+            buf.get_unchecked_mut(1).write(hi[2]);
+            buf.get_unchecked_mut(2).write(hi[3]);
+        }
+        // SAFETY: The write covers bytes 3..7 of the output buffer.
+        unsafe {
+            buf.as_mut_ptr()
+                .add(3)
+                .cast::<u32>()
+                .write_unaligned((bcd_lo | 0x30303030).to_be());
+        }
+        leading_zeros - 1
     }
 }
 
