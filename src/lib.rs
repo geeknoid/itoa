@@ -263,6 +263,12 @@ macro_rules! impl_Unsigned {
             fn fmt(self, buf: &mut Self::Buffer) -> usize {
                 // Count the number of bytes in buf that are not initialized.
                 let mut offset = buf.len();
+                if self == 0 {
+                    offset -= 1;
+                    // SAFETY: Every integer buffer has room for at least one digit.
+                    unsafe { buf.get_unchecked_mut(offset) }.write(b'0');
+                    return offset;
+                }
                 // Consume the least-significant decimals from a working copy.
                 let mut remain = self;
 
@@ -327,9 +333,135 @@ macro_rules! impl_Unsigned {
 }
 
 impl_Unsigned!(u8);
+#[cfg(not(all(target_feature = "sse4.1", target_feature = "lzcnt")))]
 impl_Unsigned!(u16);
 impl_Unsigned!(u32);
+#[cfg(not(all(target_feature = "sse4.1", target_feature = "lzcnt")))]
 impl_Unsigned!(u64);
+
+#[cfg(all(
+    target_feature = "sse4.1",
+    target_feature = "lzcnt"
+))]
+#[inline]
+#[cfg_attr(feature = "no-panic", no_panic)]
+fn to_bcd4(abcd: u16) -> u32 {
+    let abcd = u32::from(abcd);
+    let ab_cd = abcd + (0x10000 - 100) * ((abcd * 0x147b) >> 19);
+    ab_cd + (0x100 - 10) * (((ab_cd * 0x67) >> 10) & 0xf000f)
+}
+
+#[cfg(all(
+    target_feature = "sse4.1",
+    target_feature = "lzcnt"
+))]
+impl Unsigned for u16 {
+    #[cfg_attr(feature = "no-panic", no_panic)]
+    fn fmt(self, buf: &mut Self::Buffer) -> usize {
+        if self == 0 {
+            buf[4].write(b'0');
+            return 4;
+        }
+        if self >= 10_000 {
+            let high = self / 10_000;
+            let bcd = to_bcd4(self % 10_000);
+            buf[0].write(b'0' + high as u8);
+            // SAFETY: Bytes 1..5 are within the five-byte output buffer.
+            unsafe {
+                buf.as_mut_ptr()
+                    .add(1)
+                    .cast::<u32>()
+                    .write_unaligned((bcd | 0x30303030).to_be());
+            }
+            return 0;
+        }
+        let bcd = to_bcd4(self);
+        let leading_zeros = bcd.leading_zeros() as usize / 8;
+        // SAFETY: Bytes 1..5 are within the five-byte output buffer.
+        unsafe {
+            buf.as_mut_ptr()
+                .add(1)
+                .cast::<u32>()
+                .write_unaligned((bcd | 0x30303030).to_be());
+        }
+        1 + leading_zeros
+    }
+}
+
+#[cfg(all(
+    target_feature = "sse4.1",
+    target_feature = "lzcnt"
+))]
+impl Unsigned for u64 {
+    #[cfg_attr(feature = "no-panic", no_panic)]
+    fn fmt(self, buf: &mut Self::Buffer) -> usize {
+        if self == 0 {
+            buf[19].write(b'0');
+            return 19;
+        }
+        let out = buf.as_mut_ptr().cast::<u32>();
+
+        if self >= 10_000_000_000_000_000 {
+            let top = self / 10_000_000_000_000_000;
+            let hi = (self % 10_000_000_000_000_000 / 100_000_000) as u32;
+            let lo = (self % 100_000_000) as u32;
+            let bcd_top = to_bcd4(top as u16);
+            let bcd_hi_hi = to_bcd4((hi / 10_000) as u16);
+            let bcd_hi_lo = to_bcd4((hi % 10_000) as u16);
+            let bcd_lo_hi = to_bcd4((lo / 10_000) as u16);
+            let bcd_lo_lo = to_bcd4((lo % 10_000) as u16);
+            let leading_zeros = bcd_top.leading_zeros() as usize / 8;
+            // SAFETY: The five writes cover exactly the 20-byte output buffer.
+            unsafe {
+                out.write_unaligned((bcd_top | 0x30303030).to_be());
+                out.add(1).write_unaligned((bcd_hi_hi | 0x30303030).to_be());
+                out.add(2).write_unaligned((bcd_hi_lo | 0x30303030).to_be());
+                out.add(3).write_unaligned((bcd_lo_hi | 0x30303030).to_be());
+                out.add(4).write_unaligned((bcd_lo_lo | 0x30303030).to_be());
+            }
+            return leading_zeros;
+        }
+
+        if self >= 100_000_000 {
+            let hi = (self / 100_000_000) as u32;
+            let lo = (self % 100_000_000) as u32;
+            let bcd_hi_hi = to_bcd4((hi / 10_000) as u16);
+            let bcd_hi_lo = to_bcd4((hi % 10_000) as u16);
+            let bcd_lo_hi = to_bcd4((lo / 10_000) as u16);
+            let bcd_lo_lo = to_bcd4((lo % 10_000) as u16);
+            let leading_zeros =
+                ((u64::from(bcd_hi_hi) << 32) | u64::from(bcd_hi_lo)).leading_zeros() as usize / 8;
+            // SAFETY: The four writes cover bytes 4..20 of the output buffer.
+            unsafe {
+                out.add(1).write_unaligned((bcd_hi_hi | 0x30303030).to_be());
+                out.add(2).write_unaligned((bcd_hi_lo | 0x30303030).to_be());
+                out.add(3).write_unaligned((bcd_lo_hi | 0x30303030).to_be());
+                out.add(4).write_unaligned((bcd_lo_lo | 0x30303030).to_be());
+            }
+            return 4 + leading_zeros;
+        }
+
+        if self >= 10_000 {
+            let bcd_hi = to_bcd4((self / 10_000) as u16);
+            let bcd_lo = to_bcd4((self % 10_000) as u16);
+            let leading_zeros = bcd_hi.leading_zeros() as usize / 8;
+            // SAFETY: The two writes cover bytes 12..20 of the output buffer.
+            unsafe {
+                out.add(3).write_unaligned((bcd_hi | 0x30303030).to_be());
+                out.add(4).write_unaligned((bcd_lo | 0x30303030).to_be());
+            }
+            return 12 + leading_zeros;
+        }
+
+        let bcd = to_bcd4(self as u16);
+        let leading_zeros = bcd.leading_zeros() as usize / 8;
+        // SAFETY: The write covers bytes 16..20 of the output buffer.
+        unsafe {
+            out.add(4).write_unaligned((bcd | 0x30303030).to_be());
+        }
+        16 + leading_zeros
+    }
+}
 
 impl Unsigned for u128 {
     #[cfg_attr(feature = "no-panic", no_panic)]
@@ -356,7 +488,13 @@ impl Unsigned for u128 {
             } else {
                 // Write digits at buf[7..23].
                 enc_16lsd::<{ u128::MAX_STR_LEN - 32 }>(buf, mod2);
+                #[cfg(all(
+                    target_feature = "sse4.1",
+                    target_feature = "lzcnt"
+                ))]
+                return enc_7msd(buf, quot2 as u32);
                 // Quot2 has at most 7 decimals remaining after two 1e16 divisions.
+                #[cfg(not(all(target_feature = "sse4.1", target_feature = "lzcnt")))]
                 (quot2 as u64, u128::MAX_STR_LEN - 32)
             }
         };
@@ -404,6 +542,7 @@ impl Unsigned for u128 {
 }
 
 // Encodes the 16 least-significant decimals of n into `buf[OFFSET..OFFSET + 16]`.
+#[cfg(not(all(target_feature = "sse4.1", target_feature = "lzcnt")))]
 #[cfg_attr(feature = "no-panic", no_panic)]
 fn enc_16lsd<const OFFSET: usize>(buf: &mut [MaybeUninit<u8>], n: u64) {
     // Consume the least-significant decimals from a working copy.
@@ -434,6 +573,66 @@ fn enc_16lsd<const OFFSET: usize>(buf: &mut [MaybeUninit<u8>], n: u64) {
         buf[OFFSET + 1].write(*DECIMAL_PAIRS.0.get_unchecked(pair1 as usize * 2 + 1));
         buf[OFFSET + 2].write(*DECIMAL_PAIRS.0.get_unchecked(pair2 as usize * 2 + 0));
         buf[OFFSET + 3].write(*DECIMAL_PAIRS.0.get_unchecked(pair2 as usize * 2 + 1));
+    }
+}
+
+#[cfg(all(
+    target_feature = "sse4.1",
+    target_feature = "lzcnt"
+))]
+#[cfg_attr(feature = "no-panic", no_panic)]
+fn enc_16lsd<const OFFSET: usize>(buf: &mut [MaybeUninit<u8>], n: u64) {
+    let hi = (n / 100_000_000) as u32;
+    let lo = (n % 100_000_000) as u32;
+    // SAFETY: Callers provide an offset with at least 16 remaining bytes.
+    let out = unsafe { buf.as_mut_ptr().add(OFFSET).cast::<u32>() };
+    let bcd_hi_hi = to_bcd4((hi / 10_000) as u16);
+    let bcd_hi_lo = to_bcd4((hi % 10_000) as u16);
+    let bcd_lo_hi = to_bcd4((lo / 10_000) as u16);
+    let bcd_lo_lo = to_bcd4((lo % 10_000) as u16);
+    // SAFETY: The four writes cover the 16 bytes starting at OFFSET.
+    unsafe {
+        out.write_unaligned((bcd_hi_hi | 0x30303030).to_be());
+        out.add(1).write_unaligned((bcd_hi_lo | 0x30303030).to_be());
+        out.add(2).write_unaligned((bcd_lo_hi | 0x30303030).to_be());
+        out.add(3).write_unaligned((bcd_lo_lo | 0x30303030).to_be());
+    }
+}
+
+#[cfg(all(
+    target_feature = "sse4.1",
+    target_feature = "lzcnt"
+))]
+#[cfg_attr(feature = "no-panic", no_panic)]
+fn enc_7msd(buf: &mut [MaybeUninit<u8>], n: u32) -> usize {
+    debug_assert!(n < 10_000_000);
+    if n < 10_000 {
+        let bcd = to_bcd4(n as u16);
+        let leading_zeros = bcd.leading_zeros() as usize / 8;
+        // SAFETY: The write covers bytes 3..7 of the output buffer.
+        unsafe {
+            buf.as_mut_ptr()
+                .add(3)
+                .cast::<u32>()
+                .write_unaligned((bcd | 0x30303030).to_be());
+        }
+        3 + leading_zeros
+    } else {
+        let bcd_hi = to_bcd4((n / 10_000) as u16);
+        let bcd_lo = to_bcd4((n % 10_000) as u16);
+        let leading_zeros = bcd_hi.leading_zeros() as usize / 8;
+        let hi = (bcd_hi | 0x30303030).to_be_bytes();
+        buf[0].write(hi[1]);
+        buf[1].write(hi[2]);
+        buf[2].write(hi[3]);
+        // SAFETY: The write covers bytes 3..7 of the output buffer.
+        unsafe {
+            buf.as_mut_ptr()
+                .add(3)
+                .cast::<u32>()
+                .write_unaligned((bcd_lo | 0x30303030).to_be());
+        }
+        leading_zeros - 1
     }
 }
 

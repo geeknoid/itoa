@@ -47,6 +47,21 @@ library.
 
 ![performance](https://raw.githubusercontent.com/dtolnay/itoa/master/itoa-benchmark.png)
 
+This repository also contains Criterion and Gungraun microbenchmarks. Run the
+Gungraun benchmarks with:
+
+```console
+cargo install --version 0.18.2 gungraun-runner
+cargo bench --bench gungraun
+```
+
+Gungraun requires Valgrind to be installed.
+On x86-64, compile for the host CPU to benchmark the SIMD-optimized path:
+
+```console
+RUSTFLAGS="-C target-cpu=native" cargo bench --bench gungraun
+```
+
 <br>
 
 #### License

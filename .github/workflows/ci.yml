@@ -37,6 +37,11 @@ jobs:
       - run: cargo build
       - run: cargo test
       - run: cargo test --release
+      - name: Test SIMD formatting path
+        run: cargo test --release
+        if: matrix.rust == 'stable'
+        env:
+          RUSTFLAGS: -Dwarnings -C target-feature=+sse4.1,+lzcnt
       - run: cargo build --no-default-features
       - run: cargo test --tests --no-default-features
       - run: cargo test --tests --no-default-features --release
